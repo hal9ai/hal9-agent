@@ -1,0 +1,35 @@
+name: Apps
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  devel:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v1
+      with:
+        python-version: '3.10'
+
+    - name: Install Hal9
+      run: pip install hal9
+
+    - uses: actions/checkout@v1
+    - name: Get changed files
+      id: changed-files
+      uses: tj-actions/changed-files@v45
+      with:
+        since_last_remote_commit: true
+    - name: Print changed-files outputs
+      run: echo "${{ toJson(steps.changed-files.outputs) }}"
+
+    - name: Deploy changed apps
+      env:
+        ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+        HAL9_TOKEN: ${{ secrets.HAL9_TOKEN_DEVEL }}
+        HAL9_URL: ${{ secrets.HAL9_URL }}
+      run: |
+        hal9 deploy apps/hal9 --name hal9 --access public --url "$HAL9_URL" --title Hal9 --description "Conversations and content creation";
