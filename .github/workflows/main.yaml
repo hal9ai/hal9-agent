@@ -29,7 +29,7 @@ jobs:
     - name: Deploy changed apps
       env:
         ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
-        HAL9_TOKEN: ${{ secrets.HAL9_TOKEN_DEVEL }}
+        HAL9_TOKEN: ${{ secrets.HAL9_TOKEN }}
         HAL9_URL: ${{ secrets.HAL9_URL }}
       run: |
         hal9 deploy apps/hal9 --name hal9 --access public --url "$HAL9_URL" --title Hal9 --description "Conversations and content creation";
