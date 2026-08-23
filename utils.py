@@ -66,6 +66,23 @@ def _looks_like_malformed_tool_call(text: str) -> bool:
         or text.lstrip().startswith("[")
     )
 
+def _parse_qwen_tool_call(text: str) -> Optional[tuple[str, dict]]:
+    """Parse Qwen XML-style tool calls that Groq rejects as tool_use_failed."""
+    if not text:
+        return None
+    func = re.search(r"<function=([A-Za-z0-9_]+)>", text)
+    if not func:
+        return None
+    name = func.group(1)
+    args: dict[str, str] = {}
+    for match in re.finditer(
+        r"<parameter=([A-Za-z0-9_]+)>\s*(.*?)\s*</parameter>",
+        text,
+        flags=re.DOTALL,
+    ):
+        args[match.group(1)] = match.group(2).strip()
+    return name, args
+
 def _synthetic_tool_call_response(name: str, arguments: dict) -> SimpleNamespace:
     """Build a completion-shaped object so existing tool-call handlers still work."""
     tool_call = SimpleNamespace(
@@ -148,16 +165,21 @@ def generate_response(
             last_failed_generation = failed_generation
             continue
 
-    if (
-        last_failed_generation
-        and not _looks_like_malformed_tool_call(last_failed_generation)
-        and _has_tool_named(tools, "final_response")
-    ):
-        h9.event("Tool call fallback", last_failed_generation)
-        return _synthetic_tool_call_response(
-            "final_response",
-            {"final_message": last_failed_generation},
-        )
+    if last_failed_generation:
+        parsed = _parse_qwen_tool_call(last_failed_generation)
+        if parsed and _has_tool_named(tools, parsed[0]):
+            name, arguments = parsed
+            h9.event("Tool call XML fallback", name)
+            return _synthetic_tool_call_response(name, arguments)
+        if (
+            not _looks_like_malformed_tool_call(last_failed_generation)
+            and _has_tool_named(tools, "final_response")
+        ):
+            h9.event("Tool call fallback", last_failed_generation)
+            return _synthetic_tool_call_response(
+                "final_response",
+                {"final_message": last_failed_generation},
+            )
 
     raise last_error
 
