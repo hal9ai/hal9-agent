@@ -1,10 +1,11 @@
 """
-Clone a GitHub repository, apply changes with Claude Code, and open a PR.
+Change a GitHub repository with Claude Code and open a PR into main.
 
-Uses GITHUB_PAT for git/GitHub API auth and ANTHROPIC_API_KEY for Claude.
-The repo is cloned into a system temp directory (not ./.storage) so it is
-never uploaded to Hal9 via h9.save(). Changes are pushed on a feature
-branch and opened as a pull request targeting main.
+The Hal9 runtime has no git and cannot apt-install it (unprivileged).
+This tool downloads the repo as a zip, lets Claude Code edit files locally,
+then creates the branch, commit, and pull request through the GitHub HTTP API.
+Uses GITHUB_PAT and ANTHROPIC_API_KEY. Work happens in a temp directory,
+not ./.storage, so it is never uploaded via h9.save().
 """
 
 import asyncio
@@ -76,20 +77,8 @@ def _parse_github_repo(repo: str) -> tuple[str, str]:
     )
 
 
-def _authenticated_clone_url(owner: str, name: str, token: str) -> str:
-    return f"https://x-access-token:{token}@github.com/{owner}/{name}.git"
-
-
 def _redact_token(text: str) -> str:
     return re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", text)
-
-
-def _log_git(message: str) -> None:
-    print(f"[git] {message}", flush=True)
-    try:
-        h9.event("Claude Code git", message[:500])
-    except Exception:
-        pass
 
 
 def _clip(text: str, limit: int = 1200) -> str:
@@ -97,191 +86,6 @@ def _clip(text: str, limit: int = 1200) -> str:
     if len(text) > limit:
         return text[:limit] + f"... ({len(text)} chars)"
     return text
-
-
-def _is_root() -> bool:
-    geteuid = getattr(os, "geteuid", None)
-    if geteuid is None:
-        return False
-    return geteuid() == 0
-
-
-def _privileged_variants(cmd: list[str], allow_sudo: bool = True) -> list[list[str]]:
-    variants = [cmd]
-    if allow_sudo and not _is_root() and shutil.which("sudo"):
-        variants.append(["sudo", "-n", *cmd])
-    return variants
-
-
-def _run_install_command(cmd: list[str], env: Optional[dict] = None) -> subprocess.CompletedProcess:
-    _log_git(f"running: {' '.join(cmd)}")
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=5 * 60,
-    )
-    _log_git(f"exit {result.returncode}")
-    if result.stdout:
-        _log_git(f"stdout: {_clip(result.stdout)}")
-    if result.stderr:
-        _log_git(f"stderr: {_clip(result.stderr)}")
-    return result
-
-
-def _known_git_paths() -> list[str]:
-    return [
-        shutil.which("git") or "",
-        "/usr/bin/git",
-        "/usr/local/bin/git",
-        "/bin/git",
-        "/opt/homebrew/bin/git",
-    ]
-
-
-def _find_git() -> Optional[str]:
-    for path in _known_git_paths():
-        if path and os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return None
-
-
-def _log_git_diagnostics() -> None:
-    uid = getattr(os, "getuid", lambda: "n/a")()
-    euid = getattr(os, "geteuid", lambda: "n/a")()
-    _log_git(f"uid={uid} euid={euid} root={_is_root()} cwd={os.getcwd()}")
-    _log_git(f"PATH={os.environ.get('PATH', '')}")
-    for tool in (
-        "git", "sudo", "apt-get", "apt", "apk", "dnf", "yum",
-        "microdnf", "pacman", "zypper", "brew",
-    ):
-        _log_git(f"which {tool} = {shutil.which(tool) or '(not found)'}")
-    for path in ("/usr/bin/git", "/usr/local/bin/git", "/bin/git"):
-        exists = os.path.exists(path)
-        executable = os.access(path, os.X_OK) if exists else False
-        _log_git(f"{path} exists={exists} executable={executable}")
-
-
-def _ensure_git() -> Optional[str]:
-    """
-    Return the git executable path if available, installing it when possible.
-    Returns None when git cannot be installed (e.g. no root); callers should
-    fall back to the GitHub API.
-    """
-    existing = _find_git()
-    if existing:
-        _log_git(f"found git at {existing}")
-        return existing
-
-    _log_git("git not found; attempting system install")
-    _log_git_diagnostics()
-
-    strategies: list[tuple[str, list[list[str]], Optional[dict], bool]] = []
-    apt_env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-    if shutil.which("apt-get"):
-        strategies.append((
-            "apt-get",
-            [
-                ["apt-get", "update", "-qq"],
-                ["apt-get", "install", "-y", "--no-install-recommends", "git"],
-            ],
-            apt_env,
-            True,
-        ))
-    if shutil.which("apk"):
-        strategies.append(("apk", [["apk", "add", "--no-cache", "git"]], None, True))
-    if shutil.which("dnf"):
-        strategies.append(("dnf", [["dnf", "install", "-y", "git"]], None, True))
-    if shutil.which("yum"):
-        strategies.append(("yum", [["yum", "install", "-y", "git"]], None, True))
-    if shutil.which("microdnf"):
-        strategies.append(("microdnf", [["microdnf", "install", "-y", "git"]], None, True))
-    if shutil.which("pacman"):
-        strategies.append(("pacman", [["pacman", "-Sy", "--noconfirm", "git"]], None, True))
-    if shutil.which("zypper"):
-        strategies.append(("zypper", [["zypper", "--non-interactive", "install", "git"]], None, True))
-    if shutil.which("brew"):
-        strategies.append(("brew", [["brew", "install", "git"]], None, False))
-
-    if not strategies:
-        _log_git("no supported package manager found on PATH")
-
-    for name, commands, env, allow_sudo in strategies:
-        _log_git(f"trying installer: {name}")
-        last_error = ""
-        installed = True
-        for cmd in commands:
-            step_ok = False
-            for variant in _privileged_variants(cmd, allow_sudo=allow_sudo):
-                try:
-                    result = _run_install_command(variant, env=env)
-                except Exception as e:
-                    last_error = str(e)
-                    _log_git(f"command failed to start: {last_error}")
-                    continue
-                if result.returncode == 0:
-                    step_ok = True
-                    break
-                last_error = (result.stderr or result.stdout or "").strip()
-            if not step_ok:
-                if cmd and cmd[0] == "apt-get" and "update" in cmd:
-                    _log_git("apt-get update failed; still trying apt-get install")
-                    continue
-                installed = False
-                break
-        if not installed:
-            _log_git(f"{name} failed: {_clip(last_error)}")
-            continue
-        git_path = _find_git()
-        if git_path:
-            _log_git(f"installed git via {name}: {git_path}")
-            return git_path
-        _log_git(f"{name} reported success but git is still not on PATH")
-
-    _log_git("could not install git; will use GitHub HTTP API instead")
-    return None
-
-
-def _git_bin() -> str:
-    path = _ensure_git()
-    if not path:
-        raise RuntimeError("git is not installed")
-    return path
-
-
-def _run_git(args: list[str], cwd: str, check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(
-        [_git_bin(), *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-    )
-    if check and result.returncode != 0:
-        stderr = _redact_token((result.stderr or result.stdout or "").strip())
-        raise RuntimeError(f"git {' '.join(args)} failed: {stderr}")
-    return result
-
-
-def _clone_base_and_checkout_branch(clone_url: str, dest: str, base_branch: str, work_branch: str) -> None:
-    """Clone `base_branch` (usually main), then create the feature branch from it."""
-    git = _git_bin()
-    result = subprocess.run(
-        [git, "clone", "--depth", "1", "--branch", base_branch, clone_url, dest],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        result = subprocess.run(
-            [git, "clone", "--depth", "1", clone_url, dest],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            stderr = _redact_token((result.stderr or result.stdout or "").strip())
-            raise RuntimeError(f"Failed to clone repository: {stderr}")
-
-    _run_git(["checkout", "-B", work_branch], cwd=dest)
 
 
 def _slugify_branch(prompt: str) -> str:
@@ -411,44 +215,6 @@ def _run_claude_code(prompt: str, cwd: str, model: str, api_key: str) -> str:
     return _run_claude_cli(prompt, cwd, model, api_key)
 
 
-def _has_changes(cwd: str) -> bool:
-    result = _run_git(["status", "--porcelain"], cwd=cwd)
-    return bool(result.stdout.strip())
-
-
-def _commits_ahead_of_base(cwd: str, base_branch: str) -> int:
-    result = _run_git(
-        ["rev-list", "--count", f"origin/{base_branch}..HEAD"],
-        cwd=cwd,
-        check=False,
-    )
-    if result.returncode != 0:
-        result = _run_git(
-            ["rev-list", "--count", f"{base_branch}..HEAD"],
-            cwd=cwd,
-            check=False,
-        )
-    try:
-        return int((result.stdout or "0").strip() or "0")
-    except ValueError:
-        return 0
-
-
-def _commit_changes(cwd: str, commit_message: str) -> str:
-    _run_git(["config", "user.email", "hal9@hal9.com"], cwd=cwd)
-    _run_git(["config", "user.name", "Hal9 Claude Code"], cwd=cwd)
-    _run_git(["add", "-A"], cwd=cwd)
-    if not _has_changes(cwd):
-        return ""
-    commit = _run_git(["commit", "-m", commit_message], cwd=cwd)
-    return (commit.stdout or "").strip()
-
-
-def _push_branch(cwd: str, branch: str) -> str:
-    push = _run_git(["push", "-u", "origin", f"HEAD:{branch}"], cwd=cwd)
-    return (push.stdout or push.stderr or "").strip()
-
-
 def _github_headers(token: str) -> dict:
     return {
         "Authorization": f"Bearer {token}",
@@ -461,22 +227,18 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".venv", "node_modules", ".storage"}
 
 
 def _github_json(method: str, url: str, token: str, **kwargs) -> requests.Response:
-    _log_git(f"GitHub API {method} {url}")
-    response = requests.request(
+    return requests.request(
         method,
         url,
         headers=_github_headers(token),
         timeout=kwargs.pop("timeout", 60),
         **kwargs,
     )
-    _log_git(f"GitHub API status {response.status_code}")
-    return response
 
 
 def _resolve_base_branch(owner: str, name: str, token: str) -> str:
     response = _github_json("GET", f"https://api.github.com/repos/{owner}/{name}", token, timeout=30)
     if response.status_code != 200:
-        _log_git(f"repo lookup failed ({response.status_code}): {_clip(response.text)}")
         return BASE_BRANCH
     default_branch = (response.json() or {}).get("default_branch") or BASE_BRANCH
     main_ref = _github_json(
@@ -487,15 +249,12 @@ def _resolve_base_branch(owner: str, name: str, token: str) -> str:
     )
     if main_ref.status_code == 200:
         return BASE_BRANCH
-    _log_git(f"{BASE_BRANCH} ref missing; using default branch {default_branch}")
     return default_branch
 
 
 def _clone_via_github_zip(owner: str, name: str, token: str, dest: str, base_branch: str) -> str:
     url = f"https://api.github.com/repos/{owner}/{name}/zipball/{base_branch}"
-    _log_git(f"downloading zipball {owner}/{name}@{base_branch}")
     response = requests.get(url, headers=_github_headers(token), timeout=120, allow_redirects=True)
-    _log_git(f"zipball status {response.status_code} bytes={len(response.content)}")
     if response.status_code != 200:
         raise RuntimeError(
             f"Failed to download {owner}/{name}@{base_branch} as zip "
@@ -506,9 +265,7 @@ def _clone_via_github_zip(owner: str, name: str, token: str, dest: str, base_bra
         archive.extractall(dest)
     entries = [os.path.join(dest, entry) for entry in os.listdir(dest)]
     dirs = [entry for entry in entries if os.path.isdir(entry)]
-    repo_dir = dirs[0] if len(dirs) == 1 else dest
-    _log_git(f"extracted repository to {repo_dir}")
-    return repo_dir
+    return dirs[0] if len(dirs) == 1 else dest
 
 
 def _snapshot_files(root: str) -> dict[str, str]:
@@ -571,7 +328,6 @@ def _publish_changes_via_github_api(
     before: dict[str, str],
 ) -> str:
     changed, deleted = _diff_snapshots(before, _snapshot_files(repo_dir))
-    _log_git(f"file diff: {len(changed)} changed, {len(deleted)} deleted")
     if not changed and not deleted:
         return ""
 
@@ -600,7 +356,6 @@ def _publish_changes_via_github_api(
         path = os.path.join(repo_dir, rel)
         with open(path, "rb") as handle:
             content = handle.read()
-        _log_git(f"uploading blob for {rel} ({len(content)} bytes)")
         tree_items.append({
             "path": rel,
             "mode": _file_mode(path),
@@ -641,7 +396,6 @@ def _publish_changes_via_github_api(
             f"Failed to create commit ({new_commit.status_code}): {_clip(new_commit.text)}"
         )
     new_sha = new_commit.json()["sha"]
-    _log_git(f"created commit {new_sha} on {work_branch}")
 
     create_ref = _github_json(
         "POST",
@@ -715,8 +469,7 @@ def claude_code_github(
     pr_title: str = "",
 ):
     """
-    Clone a GitHub repo, apply changes with Claude Code, push a feature branch,
-    and open a pull request into main.
+    Download a GitHub repo, apply changes with Claude Code, and open a PR into main.
     """
     model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     commit_message = (commit_message or DEFAULT_COMMIT_MESSAGE).strip() or DEFAULT_COMMIT_MESSAGE
@@ -730,58 +483,37 @@ def claude_code_github(
     except ValueError as e:
         return f"Error: {e}"
 
-    git_path = _ensure_git()
-    clone_url = _authenticated_clone_url(owner, name, github_pat)
     public_url = f"https://github.com/{owner}/{name}"
-    base_branch = BASE_BRANCH
-
     work_root: Optional[str] = None
     try:
         work_root = tempfile.mkdtemp(prefix="hal9-claude-code-")
-        repo_dir = os.path.join(work_root, name)
-        before_snapshot: Optional[dict[str, str]] = None
+        dest = os.path.join(work_root, name)
+        base_branch = _resolve_base_branch(owner, name, github_pat)
 
-        if git_path:
-            _log_git(f"cloning with git ({git_path})")
-            h9.event("Claude Code", f"Cloning {public_url} ({base_branch}) into temp dir")
-            _clone_base_and_checkout_branch(clone_url, repo_dir, base_branch, work_branch)
-            _run_git(["remote", "set-url", "origin", clone_url], cwd=repo_dir)
-        else:
-            base_branch = _resolve_base_branch(owner, name, github_pat)
-            _log_git(f"cloning via GitHub zip API (base={base_branch})")
-            repo_dir = _clone_via_github_zip(owner, name, github_pat, repo_dir, base_branch)
-            before_snapshot = _snapshot_files(repo_dir)
+        h9.event("Claude Code", f"Downloading {public_url} ({base_branch})")
+        repo_dir = _clone_via_github_zip(owner, name, github_pat, dest, base_branch)
+        before_snapshot = _snapshot_files(repo_dir)
 
         h9.event("Claude Code", f"Running Claude Code (model={model}) on branch {work_branch}")
         claude_summary = _run_claude_code(prompt, repo_dir, model, anthropic_key)
 
-        if git_path:
-            commit_out = _commit_changes(repo_dir, commit_message)
-            if _commits_ahead_of_base(repo_dir, base_branch) == 0:
-                return (
-                    f"Claude Code ran on {public_url} but made no file changes, so no pull request was opened.\n\n"
-                    f"Claude summary:\n{claude_summary}"
-                )
-            h9.event("Claude Code", f"Pushing {work_branch} and opening PR into {base_branch}")
-            push_out = _push_branch(repo_dir, work_branch)
-        else:
-            commit_out = _publish_changes_via_github_api(
-                owner=owner,
-                name=name,
-                token=github_pat,
-                repo_dir=repo_dir,
-                work_branch=work_branch,
-                base_branch=base_branch,
-                commit_message=commit_message,
-                before=before_snapshot or {},
+        commit_sha = _publish_changes_via_github_api(
+            owner=owner,
+            name=name,
+            token=github_pat,
+            repo_dir=repo_dir,
+            work_branch=work_branch,
+            base_branch=base_branch,
+            commit_message=commit_message,
+            before=before_snapshot,
+        )
+        if not commit_sha:
+            return (
+                f"Claude Code ran on {public_url} but made no file changes, so no pull request was opened.\n\n"
+                f"Claude summary:\n{claude_summary}"
             )
-            if not commit_out:
-                return (
-                    f"Claude Code ran on {public_url} but made no file changes, so no pull request was opened.\n\n"
-                    f"Claude summary:\n{claude_summary}"
-                )
-            push_out = f"Published commit {commit_out} via GitHub API"
 
+        h9.event("Claude Code", f"Opening PR {work_branch} -> {base_branch}")
         pr_body = (
             f"{prompt.strip()}\n\n"
             f"---\n"
@@ -801,9 +533,8 @@ def claude_code_github(
         return (
             f"Opened pull request #{pr_number} into {base_branch} for {public_url}.\n"
             f"PR: {pr_url}\n"
-            f"Branch: {work_branch}\n\n"
-            f"Commit: {commit_out}\n"
-            f"Push: {push_out}\n\n"
+            f"Branch: {work_branch}\n"
+            f"Commit: {commit_sha}\n\n"
             f"Claude summary:\n{claude_summary}"
         )
     except Exception as e:
@@ -820,10 +551,10 @@ claude_code_github_description = {
     "function": {
         "name": "claude_code_github",
         "description": (
-            "Clones a GitHub repository, uses Claude Code (ANTHROPIC_API_KEY) to make the "
-            "requested code changes, pushes a feature branch, and opens a pull request into "
-            "main using GITHUB_PAT. Use this when the user wants to change code in a GitHub "
-            "repo and get a PR back. Never pushes directly to main."
+            "Downloads a GitHub repository, uses Claude Code (ANTHROPIC_API_KEY) to make the "
+            "requested code changes, then opens a pull request into main using GITHUB_PAT. "
+            "Use this when the user wants to change code in a GitHub repo and get a PR back. "
+            "Never pushes directly to main."
         ),
         "strict": True,
         "parameters": {
