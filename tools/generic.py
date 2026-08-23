@@ -1,15 +1,9 @@
-from clients import groq_client
-from utils import load_messages, insert_message, save_messages
+from utils import generate_response, load_messages, insert_message, save_messages
 
 def answer_generic_question(user_input):
     messages = load_messages(file_path="./.storage/.generic_agent_messages.json")
     messages = insert_message(messages, "user", user_input)
-    response = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=messages,
-        temperature=0,
-        seed=1
-    )
+    response = generate_response(messages, temperature=0, seed=1, reasoning_effort="none")
     text_response = response.choices[0].message.content
     messages = insert_message(messages, "assistant", text_response)
     save_messages(messages, file_path="./.storage/.generic_agent_messages.json")

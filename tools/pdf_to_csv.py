@@ -1,4 +1,4 @@
-from clients import openai_client
+from utils import generate_response
 import concurrent.futures
 from io import BytesIO
 import pymupdf
@@ -73,9 +73,9 @@ def generate_prompt(sample_images: list, user_prompt: str) -> str:
             "image_url": {"url": url}
         })
 
-    resp = openai_client.chat.completions.create(
-        model="o4-mini",
-        messages=[{"role": "user", "content": content}],
+    resp = generate_response(
+        [{"role": "user", "content": content}],
+        reasoning_effort="none",
     )
     return resp.choices[0].message.content
 
@@ -103,16 +103,16 @@ pdf_path: str,
 
 def image_analyzer(image_path: str, prompt: str) -> dict:
     url = generate_data_url(image_path)
-    resp = openai_client.chat.completions.create(
-        model="o4-mini",
-        messages=[{
+    resp = generate_response(
+        [{
             "role": "user",
             "content": [
                 {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": url}},
             ],
         }],
-        response_format={"type": "json_object"}
+        response_format={"type": "json_object"},
+        reasoning_effort="none",
     )
     return resp.choices[0].message.content
 
@@ -127,7 +127,7 @@ def generate_csv_based_pdf(user_prompt: str, pdf_path: str) -> str:
 
     # 2) Generate JSON template from 5 pages
     prompt = generate_prompt(
-        random.sample(images, min(len(images), 5)),
+        random.sample(images, min(len(images), 3)),
         user_prompt
     )
 

@@ -1,7 +1,7 @@
 import pandas as pd
-from utils import generate_response, load_messages, insert_message, execute_function, save_messages, insert_tool_message, generate_embeddings
+from utils import generate_response, load_messages, insert_message, execute_function, save_messages, insert_tool_message
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
 import os
 
 ########################### Functions ##########################
@@ -76,10 +76,6 @@ def retrieve_chunks_by_index(chunk_ids, file_to_filter=None):
     return df.to_dict(orient='records')
 
 def similarity_search(input_text, top_n="5", file_to_filter=None):
-    # Generate the embedding from the input text
-    query_embedding = generate_embeddings(text=input_text, model="text-embedding-3-small", client_type="openai")
-    
-    # Convert `top_n` from string to integer
     top_n = int(top_n)
     
     # Load the Parquet file into a DataFrame
@@ -88,15 +84,15 @@ def similarity_search(input_text, top_n="5", file_to_filter=None):
     # Optionally filter by file
     if file_to_filter and file_to_filter != "None":
         df = df[df['filename'] == file_to_filter]
-    
-    # Ensure the embeddings column exists
-    if 'embedding' not in df.columns:
-        raise ValueError("Embeddings not found in the dataset.")
-    
-    # Calculate cosine similarity between query_embedding and all embeddings
-    df['similarity'] = df['embedding'].apply(
-        lambda x: cosine_similarity([query_embedding], [np.array(x)])[0][0]
-    )
+
+    if df.empty:
+        return []
+
+    texts = df['text'].fillna("").tolist()
+    vectorizer = TfidfVectorizer(stop_words="english")
+    matrix = vectorizer.fit_transform(texts + [input_text])
+    df = df.copy()
+    df['similarity'] = cosine_similarity(matrix[-1], matrix[:-1]).flatten()
     
     # Sort by similarity and take the top N
     top_matches = df.nlargest(top_n, 'similarity')
@@ -324,7 +320,7 @@ def analyze_text_file(user_query):
     steps = 0
     max_steps = 10
     while steps < max_steps:
-        response = generate_response("openai", "o3-mini", messages, tools_descriptions, tool_choice = "required")
+        response = generate_response(messages, tools_descriptions, tool_choice="required")
         tool_result = execute_function(response, tools_functions)
         insert_tool_message(messages, response, tool_result)
         save_messages(messages, file_path="./.storage/.text_agent_messages.json")

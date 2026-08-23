@@ -1,6 +1,5 @@
 from utils import generate_response, insert_message, extract_code_block
 import traceback
-from clients import openai_client
 import sys
 import subprocess
 import venv
@@ -16,9 +15,8 @@ def run_in_new_process(python_code):
     return result.stdout, result.stderr
 
 def fix_code(chat_input, error, complete_traceback, python_code):
-    stream = openai_client.chat.completions.create(
-      model =  "gpt-4-turbo",
-      messages = [
+    stream = generate_response(
+      [
         {"role": "user", "content": 
 f"""The following Python code needs to be fixed. It should fulfill this user request: '{chat_input}', return the fixed code as fenced code block with triple backticks (```) as ```python```
 
@@ -38,8 +36,9 @@ If a file is generated for the user, it must be stored in './.storage/'.
 
 {complete_traceback}
 """
-    },]
-  )
+    },],
+      reasoning_effort="default",
+    )
     return extract_code_block(stream.choices[0].message.content, "python"), extract_code_block(stream.choices[0].message.content, "requirements")
 
 def install_packages(package_list: str):
@@ -81,7 +80,7 @@ def python_execution(prompt):
     if len(messages) < 1:
         messages = insert_message(messages, "system", f"This Python generation system creates scripts from user prompts, including necessary imports; always include a print message indicating the process finished or the output. If a file is generated for the user, it must be stored in './.storage/'. Return the code as a fenced block using triple backticks (```python```).")
     messages = insert_message(messages, "user", f"Generates an app that fullfills this user request -> {prompt}")
-    model_response = generate_response("openai", "o3-mini", messages) 
+    model_response = generate_response(messages, reasoning_effort="default") 
     response_content = model_response.choices[0].message.content
     generated_code = extract_code_block(response_content, "python")
     # Debug and fix the code if needed

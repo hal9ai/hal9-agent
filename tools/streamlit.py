@@ -1,15 +1,13 @@
 from utils import generate_response, load_messages, insert_message, extract_code_block, save_messages
 import os
 import traceback
-from clients import openai_client
 import hal9 as h9
 import shutil
 import datetime
 
 def fix_code(chat_input, error, complete_traceback, python_code):
-    stream = openai_client.chat.completions.create(
-      model =  "gpt-4-turbo",
-      messages = [
+    stream = generate_response(
+      [
         {"role": "user", "content": 
 f"""The following Python code needs to be fixed. It should create a interactive Streamlit app fulfill this user request: '{chat_input}', return the fixed code as fenced code block with triple backticks (```) as ```python```
 
@@ -25,8 +23,9 @@ f"""The following Python code needs to be fixed. It should create a interactive 
 
 {complete_traceback}
 """
-    },]
-  )
+    },],
+      reasoning_effort="default",
+    )
     return extract_code_block(stream.choices[0].message.content, "python")
 
 def debug_code(python_code):
@@ -92,13 +91,14 @@ def streamlit_generator(prompt):
                 "You work in a Python streamlit generator system that automates the creation of Streamlit apps based on user prompts. " 
                 "The system interprets natural language queries, and respondes a complete python script with the including imports for an interactive Streamlit app."
                 "Your task is to return the code inside of a fenced code block with triple backticks (```) as ```python```\n"
-                "IMPORTANT: If the app requires using LLMs (OpenAI, Groq, Anthropic), retrieve the API key from the environment variable 'HAL9_TOKEN' and set the base_url to 'http://api.hal9.com/proxy/server=https://api.groq.com/openai/v1' replacing api.groq.com/openai/v1 with the right path to the LLM API "
-                "and use it in the code. Do not include any other text or explanation, just the code.\n"
+                "IMPORTANT: If the app requires an LLM, use Groq with model 'qwen/qwen3.6-27b'. "
+                "Retrieve the API key from HAL9_TOKEN and set base_url to f\"{os.environ['HAL9_URL']}/proxy/server=https://api.groq.com/\". "
+                "Use the groq Python SDK (from groq import Groq), not OpenAI. Do not include any other text or explanation, just the code.\n"
             )
         )   
 
     messages = insert_message(messages, "user", f"Generates an app that fullfills this user request -> {prompt}")
-    model_response = generate_response("openai", "o3-mini", messages) 
+    model_response = generate_response(messages, reasoning_effort="default") 
     response_content = model_response.choices[0].message.content
     streamlit_code = extract_code_block(response_content, "python")
     # Debug and fix the code if needed

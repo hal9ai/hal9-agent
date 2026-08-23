@@ -1,14 +1,13 @@
 import hal9 as h9
 import os
 
-from clients import openai_client
+from utils import generate_response
 
 def website_generator(prompt):
   """
   Builds or modifies a website based on user description or a change request
     'prompt' with user change or requirements
   """
-  client = openai_client
 
   system = """You can build html applications for user requests. Your replies can include markdown code blocks but they must include a filename parameter after the language. For example,
   ```javascript filename=code.js
@@ -23,7 +22,7 @@ def website_generator(prompt):
 
   messages.append({"role": "user", "content": prompt})
 
-  completion = client.chat.completions.create(model = "gpt-4", messages = messages, stream = True)
+  completion = generate_response(messages, stream=True, reasoning_effort="default")
   response = h9.complete(completion, messages, show = False)
 
   files = h9.extract(response, default=files)
@@ -32,7 +31,7 @@ def website_generator(prompt):
   h9.save("index.html", files=files)
 
   messages.append({"role": "user", "content": "briefly describe what was accomplished"})
-  completion = client.chat.completions.create(model = "gpt-4", messages = messages)
+  completion = generate_response(messages, reasoning_effort="none")
   summary = h9.complete(completion, messages, show = False)
   return summary
 

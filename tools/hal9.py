@@ -1,13 +1,16 @@
 from data import DATA
-from groq import Groq
-import os
+from utils import generate_response
 
 def answer_hal9_questions(user_input):
-    response = Groq(base_url="https://api.hal9.com/proxy/server=https://api.groq.com/", api_key=os.environ['HAL9_TOKEN']).chat.completions.create(
-        model = "llama3-70b-8192",
-        messages = [{"role": "system", "content": DATA["hal9"]},{"role": "user", "content": user_input}],
-        temperature = 0,
-        seed = 1,)
+    response = generate_response(
+        [
+            {"role": "system", "content": DATA["hal9"]},
+            {"role": "user", "content": user_input},
+        ],
+        temperature=0,
+        seed=1,
+        reasoning_effort="none",
+    )
 
     return response.choices[0].message.content
 

@@ -63,7 +63,7 @@ else:
     completed = False
     while steps < max_steps:
         steps += 1
-        response = generate_response("openai", "o3-mini", messages, tools_descriptions, tool_choice="required")
+        response = generate_response(messages, tools_descriptions, tool_choice="required")
         tool_result = execute_function(response, tools_functions)
         insert_tool_message(messages, response, tool_result)
         response_message = response.choices[0].message

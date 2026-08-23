@@ -1,7 +1,6 @@
 from utils import generate_response, load_messages, insert_message, extract_code_block, save_messages
 import os
 import traceback
-from clients import openai_client
 
 def save_python_code(code):
     directory = "./.storage/app.py"
@@ -38,7 +37,7 @@ async def roll():
 ```
         """)
     messages = insert_message(messages, "user", f"Generates an app that fullfills this user request -> {prompt}")
-    model_response = generate_response("openai", "o3-mini", messages) 
+    model_response = generate_response(messages, reasoning_effort="default") 
     response_content = model_response.choices[0].message.content
     fastapi_code = extract_code_block(response_content, "python")
 
