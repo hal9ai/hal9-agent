@@ -432,12 +432,22 @@ def _create_pull_request(
     head: str,
     base: str,
     body: str,
+    head_owner: Optional[str] = None,
 ) -> tuple[str, int]:
+    """
+    Open a PR on owner/name.
+
+    Same-repo: head is the branch name.
+    Cross-fork: head_owner is the fork owner and head is "fork_owner:branch",
+    posted against the upstream repo.
+    """
+    head_ref = f"{head_owner}:{head}" if head_owner and head_owner != owner else head
+    query_head = f"{head_owner or owner}:{head}"
     url = f"https://api.github.com/repos/{owner}/{name}/pulls"
     response = requests.post(
         url,
         headers=_github_headers(token),
-        json={"title": title, "head": head, "base": base, "body": body},
+        json={"title": title, "head": head_ref, "base": base, "body": body},
         timeout=30,
     )
     if response.status_code in (200, 201):
@@ -449,7 +459,7 @@ def _create_pull_request(
         existing = requests.get(
             url,
             headers=_github_headers(token),
-            params={"head": f"{owner}:{head}", "base": base, "state": "open"},
+            params={"head": query_head, "base": base, "state": "open"},
             timeout=30,
         )
         if existing.status_code == 200 and existing.json():
@@ -467,9 +477,13 @@ def claude_code_github(
     model: str = DEFAULT_MODEL,
     commit_message: str = DEFAULT_COMMIT_MESSAGE,
     pr_title: str = "",
+    pr_repo: str = "",
 ):
     """
-    Download a GitHub repo, apply changes with Claude Code, and open a PR into main.
+    Download a GitHub repo, apply changes with Claude Code, and open a PR.
+
+    `repo` is where the feature branch is pushed (often a fork).
+    `pr_repo` is the repository that receives the pull request (often upstream).
     """
     model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     commit_message = (commit_message or DEFAULT_COMMIT_MESSAGE).strip() or DEFAULT_COMMIT_MESSAGE
@@ -480,18 +494,22 @@ def claude_code_github(
         github_pat = _require_env("GITHUB_PAT")
         anthropic_key = _require_env("ANTHROPIC_API_KEY")
         owner, name = _parse_github_repo(repo)
+        pr_owner, pr_name = _parse_github_repo(pr_repo or repo)
     except ValueError as e:
         return f"Error: {e}"
 
     public_url = f"https://github.com/{owner}/{name}"
+    pr_url_base = f"https://github.com/{pr_owner}/{pr_name}"
+    cross_fork = (pr_owner, pr_name) != (owner, name)
     work_root: Optional[str] = None
     try:
         work_root = tempfile.mkdtemp(prefix="hal9-claude-code-")
         dest = os.path.join(work_root, name)
-        base_branch = _resolve_base_branch(owner, name, github_pat)
+        fork_base = _resolve_base_branch(owner, name, github_pat)
+        pr_base = _resolve_base_branch(pr_owner, pr_name, github_pat) if cross_fork else fork_base
 
-        h9.event("Claude Code", f"Downloading {public_url} ({base_branch})")
-        repo_dir = _clone_via_github_zip(owner, name, github_pat, dest, base_branch)
+        h9.event("Claude Code", f"Downloading {public_url} ({fork_base})")
+        repo_dir = _clone_via_github_zip(owner, name, github_pat, dest, fork_base)
         before_snapshot = _snapshot_files(repo_dir)
 
         h9.event("Claude Code", f"Running Claude Code (model={model}) on branch {work_branch}")
@@ -503,7 +521,7 @@ def claude_code_github(
             token=github_pat,
             repo_dir=repo_dir,
             work_branch=work_branch,
-            base_branch=base_branch,
+            base_branch=fork_base,
             commit_message=commit_message,
             before=before_snapshot,
         )
@@ -513,7 +531,12 @@ def claude_code_github(
                 f"Claude summary:\n{claude_summary}"
             )
 
-        h9.event("Claude Code", f"Opening PR {work_branch} -> {base_branch}")
+        h9.event(
+            "Claude Code",
+            f"Opening PR {owner}:{work_branch} -> {pr_owner}/{pr_name}:{pr_base}"
+            if cross_fork else
+            f"Opening PR {work_branch} -> {pr_base}",
+        )
         pr_body = (
             f"{prompt.strip()}\n\n"
             f"---\n"
@@ -521,19 +544,20 @@ def claude_code_github(
             f"Claude summary:\n{claude_summary}"
         )
         pr_url, pr_number = _create_pull_request(
-            owner=owner,
-            name=name,
+            owner=pr_owner,
+            name=pr_name,
             token=github_pat,
             title=title,
             head=work_branch,
-            base=base_branch,
+            base=pr_base,
             body=pr_body,
+            head_owner=owner if cross_fork else None,
         )
 
         return (
-            f"Opened pull request #{pr_number} into {base_branch} for {public_url}.\n"
+            f"Opened pull request #{pr_number} into {pr_url_base} ({pr_base}).\n"
             f"PR: {pr_url}\n"
-            f"Branch: {work_branch}\n"
+            f"From: {public_url} branch {work_branch}\n"
             f"Commit: {commit_sha}\n\n"
             f"Claude summary:\n{claude_summary}"
         )
@@ -552,8 +576,9 @@ claude_code_github_description = {
         "name": "claude_code_github",
         "description": (
             "Downloads a GitHub repository, uses Claude Code (ANTHROPIC_API_KEY) to make the "
-            "requested code changes, then opens a pull request into main using GITHUB_PAT. "
-            "Use this when the user wants to change code in a GitHub repo and get a PR back. "
+            "requested code changes, pushes a feature branch, and opens a pull request using "
+            "GITHUB_PAT. If the user names a fork and a source/upstream repo, set repo to the "
+            "fork (where the branch is pushed) and pr_repo to the upstream (where the PR is opened). "
             "Never pushes directly to main."
         ),
         "strict": True,
@@ -563,8 +588,9 @@ claude_code_github_description = {
                 "repo": {
                     "type": "string",
                     "description": (
-                        "GitHub repository as 'owner/repo' or a full github.com URL "
-                        "(e.g. 'acme/api' or 'https://github.com/acme/api')."
+                        "GitHub repository to download and push the feature branch to, as "
+                        "'owner/repo' or a github.com URL. For a fork workflow this is the fork "
+                        "(e.g. 'hal9oo1/hal9-agent')."
                     ),
                 },
                 "prompt": {
@@ -601,8 +627,17 @@ claude_code_github_description = {
                         "Title for the GitHub pull request. Use a concise summary of the change."
                     ),
                 },
+                "pr_repo": {
+                    "type": "string",
+                    "description": (
+                        "Repository that should receive the pull request, as 'owner/repo'. "
+                        "If the user wants the PR on a source/upstream repo (e.g. "
+                        "'hal9ai/hal9-agent') while working on a fork, set this to the upstream. "
+                        "If the PR should stay on the same repo as `repo`, pass the same value."
+                    ),
+                },
             },
-            "required": ["repo", "prompt", "branch", "model", "commit_message", "pr_title"],
+            "required": ["repo", "prompt", "branch", "model", "commit_message", "pr_title", "pr_repo"],
             "additionalProperties": False,
         },
     },
