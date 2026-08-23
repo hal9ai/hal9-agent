@@ -1,0 +1,10 @@
+openai
+requests
+pymupdf
+pandas
+pyarrow
+replicate
+groq
+scikit-learn
+numpy
+pillow

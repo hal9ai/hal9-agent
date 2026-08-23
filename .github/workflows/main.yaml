@@ -6,7 +6,7 @@ on:
       - main
 
 jobs:
-  devel:
+  deploy:
     runs-on: ubuntu-latest
     steps:
     - name: Set up Python 3.10
