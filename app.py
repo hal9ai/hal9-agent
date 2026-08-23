@@ -64,11 +64,18 @@ else:
     while steps < max_steps:
         steps += 1
         response = generate_response(messages, tools_descriptions, tool_choice="required")
+        response_message = response.choices[0].message
+        tool_calls = getattr(response_message, "tool_calls", None)
+        if not tool_calls:
+            content = (getattr(response_message, "content", None) or "").strip()
+            if content:
+                print(content)
+                messages = insert_message(messages, "assistant", content)
+            completed = True
+            break
         tool_result = execute_function(response, tools_functions)
         insert_tool_message(messages, response, tool_result)
-        response_message = response.choices[0].message
-        tool_calls = getattr(response_message, 'tool_calls', None)
-        if tool_calls and tool_calls[0].function.name == "final_response":
+        if tool_calls[0].function.name == "final_response":
             completed = True
             break
     if not completed:

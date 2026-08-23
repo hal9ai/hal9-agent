@@ -1,9 +1,12 @@
 import json
 import os
 import urllib.parse
+import uuid
 import requests
+from types import SimpleNamespace
 from typing import List, Dict, Any, Optional
 from clients import groq_client, DEFAULT_MODEL
+from groq import BadRequestError
 import pymupdf
 from io import BytesIO
 import pandas as pd
@@ -11,6 +14,70 @@ import ast
 import re
 import hal9 as h9
 from replicate import Client
+
+TOOL_USE_FAILED_RETRIES = 2
+
+def _tool_use_failed_generation(error: Exception) -> Optional[str]:
+    """Extract Groq's failed_generation text from a tool_use_failed 400."""
+    body = getattr(error, "body", None)
+    if body is None:
+        response = getattr(error, "response", None)
+        if response is not None:
+            try:
+                body = response.json()
+            except Exception:
+                body = None
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except json.JSONDecodeError:
+            body = None
+    if not isinstance(body, dict):
+        return None
+    err = body.get("error", body)
+    if not isinstance(err, dict):
+        return None
+    message = str(err.get("message") or "")
+    if err.get("code") != "tool_use_failed" and "Failed to call a function" not in message:
+        return None
+    text = err.get("failed_generation")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    return None
+
+def _has_tool_named(tools: Optional[List], name: str) -> bool:
+    if not tools:
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("name") == name:
+            return True
+    return False
+
+def _looks_like_malformed_tool_call(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "<tool_call" in lowered
+        or "<function" in lowered
+        or '"name":' in lowered
+        or text.lstrip().startswith("{")
+        or text.lstrip().startswith("[")
+    )
+
+def _synthetic_tool_call_response(name: str, arguments: dict) -> SimpleNamespace:
+    """Build a completion-shaped object so existing tool-call handlers still work."""
+    tool_call = SimpleNamespace(
+        id=f"call_fallback_{uuid.uuid4().hex[:12]}",
+        type="function",
+        function=SimpleNamespace(
+            name=name,
+            arguments=json.dumps(arguments, ensure_ascii=False),
+        ),
+    )
+    message = SimpleNamespace(role="assistant", content=None, tool_calls=[tool_call])
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 def generate_response(
     messages: List[Dict[str, Any]],
@@ -25,6 +92,10 @@ def generate_response(
 ) -> Any:
     """
     Generates a Groq chat completion using qwen/qwen3.6-27b by default.
+
+    Groq returns HTTP 400 tool_use_failed when tool_choice is required but the
+    model replies in plain text instead of a function call. Retry, then salvage
+    that text as final_response when that tool is available.
     """
     payload: Dict[str, Any] = {
         "model": model,
@@ -51,7 +122,44 @@ def generate_response(
         payload["reasoning_effort"] = reasoning_effort
         payload["reasoning_format"] = "hidden"
 
-    return groq_client.chat.completions.create(**payload)
+    attempts = 1 + (TOOL_USE_FAILED_RETRIES if tools and tool_choice == "required" and not stream else 0)
+    last_error = None
+    last_failed_generation = None
+
+    for attempt in range(attempts):
+        call_payload = dict(payload)
+        if attempt > 0:
+            call_payload["messages"] = list(messages) + [{
+                "role": "system",
+                "content": (
+                    "You must call one of the provided functions. "
+                    "For greetings, small talk, or simple questions, call final_response "
+                    "with your reply. Do not answer in plain text."
+                ),
+            }]
+            h9.event("Tool call retry", f"attempt {attempt + 1}/{attempts}")
+        try:
+            return groq_client.chat.completions.create(**call_payload)
+        except BadRequestError as error:
+            failed_generation = _tool_use_failed_generation(error)
+            if failed_generation is None:
+                raise
+            last_error = error
+            last_failed_generation = failed_generation
+            continue
+
+    if (
+        last_failed_generation
+        and not _looks_like_malformed_tool_call(last_failed_generation)
+        and _has_tool_named(tools, "final_response")
+    ):
+        h9.event("Tool call fallback", last_failed_generation)
+        return _synthetic_tool_call_response(
+            "final_response",
+            {"final_message": last_failed_generation},
+        )
+
+    raise last_error
 
 def load_messages(file_path="./.storage/.messages.json") -> List[Dict[str, Any]]:
     """
@@ -106,11 +214,17 @@ def execute_function(model_response, functions, debug_mode=True):
     # Iterate over the tool calls and extract relevant information.
     for tool_call in tool_calls:
         function_name = tool_call.function.name
+        raw_args = getattr(tool_call.function, "arguments", None)
         try:
-            arguments = ast.literal_eval(tool_call.function.arguments)
-        except AttributeError as e:
-            print(f"Error accessing arguments: {e}")
-            continue
+            arguments = json.loads(raw_args)
+            if not isinstance(arguments, dict):
+                raise ValueError("tool arguments must be an object")
+        except (TypeError, json.JSONDecodeError, ValueError):
+            try:
+                arguments = ast.literal_eval(raw_args)
+            except Exception as e:
+                print(f"Error parsing arguments: {e}")
+                continue
         # Convert arguments into a string format for logging or execution.
         args_str = ', '.join(f"{k}={repr(v)}" for k, v in arguments.items())
 
