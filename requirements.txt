@@ -7,3 +7,4 @@ groq
 scikit-learn
 numpy
 pillow
+claude-agent-sdk

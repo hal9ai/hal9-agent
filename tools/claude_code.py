@@ -1,9 +1,10 @@
 """
-Clone a GitHub repository, apply changes with Claude Code, and push back.
+Clone a GitHub repository, apply changes with Claude Code, and open a PR.
 
-Uses GITHUB_PAT for git auth and ANTHROPIC_API_KEY for Claude.
+Uses GITHUB_PAT for git/GitHub API auth and ANTHROPIC_API_KEY for Claude.
 The repo is cloned into a system temp directory (not ./.storage) so it is
-never uploaded to Hal9 via h9.save().
+never uploaded to Hal9 via h9.save(). Changes are pushed on a feature
+branch and opened as a pull request targeting main.
 """
 
 import asyncio
@@ -12,13 +13,15 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Optional
 from urllib.parse import urlparse
 
 import hal9 as h9
+import requests
 
 
-DEFAULT_BRANCH = "main"
+BASE_BRANCH = "main"
 DEFAULT_MODEL = "sonnet"
 DEFAULT_COMMIT_MESSAGE = "Apply changes via Hal9 Claude Code"
 
@@ -80,34 +83,49 @@ def _run_git(args: list[str], cwd: str, check: bool = True) -> subprocess.Comple
         text=True,
     )
     if check and result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
+        stderr = _redact_token((result.stderr or result.stdout or "").strip())
         raise RuntimeError(f"git {' '.join(args)} failed: {stderr}")
     return result
 
 
-def _clone_repo(clone_url: str, dest: str, branch: str) -> None:
-    # Shallow clone of the target branch when it exists; fall back to default HEAD.
-    result = subprocess.run(
-        ["git", "clone", "--depth", "1", "--branch", branch, clone_url, dest],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0:
-        return
+def _redact_token(text: str) -> str:
+    return re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", text)
 
-    # Branch may not exist yet — clone default branch, then create/checkout target.
+
+def _clone_base_and_checkout_branch(clone_url: str, dest: str, base_branch: str, work_branch: str) -> None:
+    """Clone `base_branch` (usually main), then create the feature branch from it."""
     result = subprocess.run(
-        ["git", "clone", "--depth", "1", clone_url, dest],
+        ["git", "clone", "--depth", "1", "--branch", base_branch, clone_url, dest],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        # Avoid leaking the token in error messages
-        stderr = re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", stderr)
-        raise RuntimeError(f"Failed to clone repository: {stderr}")
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", clone_url, dest],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            stderr = _redact_token((result.stderr or result.stdout or "").strip())
+            raise RuntimeError(f"Failed to clone repository: {stderr}")
 
-    _run_git(["checkout", "-B", branch], cwd=dest)
+    _run_git(["checkout", "-B", work_branch], cwd=dest)
+
+
+def _slugify_branch(prompt: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")
+    slug = slug[:40].strip("-") or "changes"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return f"hal9/{slug}-{stamp}"
+
+
+def _normalize_work_branch(branch: str, prompt: str) -> str:
+    branch = (branch or "").strip()
+    if not branch or branch in ("main", "master", BASE_BRANCH):
+        return _slugify_branch(prompt)
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch):
+        return _slugify_branch(prompt)
+    return branch.lstrip("/")
 
 
 def _collect_text_from_sdk_message(message) -> list[str]:
@@ -226,52 +244,99 @@ def _has_changes(cwd: str) -> bool:
     return bool(result.stdout.strip())
 
 
-def _commit_and_push(
-    cwd: str,
-    branch: str,
-    commit_message: str,
-) -> str:
+def _commits_ahead_of_base(cwd: str, base_branch: str) -> int:
+    result = _run_git(
+        ["rev-list", "--count", f"origin/{base_branch}..HEAD"],
+        cwd=cwd,
+        check=False,
+    )
+    if result.returncode != 0:
+        result = _run_git(
+            ["rev-list", "--count", f"{base_branch}..HEAD"],
+            cwd=cwd,
+            check=False,
+        )
+    try:
+        return int((result.stdout or "0").strip() or "0")
+    except ValueError:
+        return 0
+
+
+def _commit_changes(cwd: str, commit_message: str) -> str:
     _run_git(["config", "user.email", "hal9@hal9.com"], cwd=cwd)
     _run_git(["config", "user.name", "Hal9 Claude Code"], cwd=cwd)
-
     _run_git(["add", "-A"], cwd=cwd)
-
     if not _has_changes(cwd):
-        # Nothing staged after add (e.g. only ignored files)
-        return "No file changes to commit."
-
-    # Allow empty=False; commit will fail if nothing staged which we already checked
+        return ""
     commit = _run_git(["commit", "-m", commit_message], cwd=cwd)
-    push = _run_git(["push", "-u", "origin", f"HEAD:{branch}"], cwd=cwd)
+    return (commit.stdout or "").strip()
 
-    return (
-        f"Committed and pushed to '{branch}'.\n"
-        f"Commit: {(commit.stdout or '').strip()}\n"
-        f"Push: {(push.stdout or push.stderr or '').strip()}"
+
+def _push_branch(cwd: str, branch: str) -> str:
+    push = _run_git(["push", "-u", "origin", f"HEAD:{branch}"], cwd=cwd)
+    return (push.stdout or push.stderr or "").strip()
+
+
+def _github_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _create_pull_request(
+    owner: str,
+    name: str,
+    token: str,
+    title: str,
+    head: str,
+    base: str,
+    body: str,
+) -> tuple[str, int]:
+    url = f"https://api.github.com/repos/{owner}/{name}/pulls"
+    response = requests.post(
+        url,
+        headers=_github_headers(token),
+        json={"title": title, "head": head, "base": base, "body": body},
+        timeout=30,
     )
+    if response.status_code in (200, 201):
+        data = response.json()
+        return data.get("html_url") or "", int(data.get("number") or 0)
+
+    # Reuse an existing open PR for the same head/base if one already exists.
+    if response.status_code == 422:
+        existing = requests.get(
+            url,
+            headers=_github_headers(token),
+            params={"head": f"{owner}:{head}", "base": base, "state": "open"},
+            timeout=30,
+        )
+        if existing.status_code == 200 and existing.json():
+            data = existing.json()[0]
+            return data.get("html_url") or "", int(data.get("number") or 0)
+
+    detail = (response.text or "").strip()
+    raise RuntimeError(f"Failed to create pull request ({response.status_code}): {detail}")
 
 
 def claude_code_github(
     repo: str,
     prompt: str,
-    branch: str = DEFAULT_BRANCH,
+    branch: str = "",
     model: str = DEFAULT_MODEL,
     commit_message: str = DEFAULT_COMMIT_MESSAGE,
+    pr_title: str = "",
 ):
     """
-    Clone a GitHub repo into a temp directory, apply changes with Claude Code,
-    commit, and push to the given branch.
-
-    Args:
-        repo: GitHub repo as 'owner/repo' or full github.com URL.
-        prompt: Natural-language description of the changes Claude Code should make.
-        branch: Branch to push to (default: main).
-        model: Claude model alias or id (default: sonnet).
-        commit_message: Git commit message for the applied changes.
+    Clone a GitHub repo, apply changes with Claude Code, push a feature branch,
+    and open a pull request into main.
     """
-    branch = (branch or DEFAULT_BRANCH).strip() or DEFAULT_BRANCH
     model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     commit_message = (commit_message or DEFAULT_COMMIT_MESSAGE).strip() or DEFAULT_COMMIT_MESSAGE
+    work_branch = _normalize_work_branch(branch, prompt)
+    title = (pr_title or "").strip() or commit_message
 
     try:
         github_pat = _require_env("GITHUB_PAT")
@@ -288,32 +353,48 @@ def claude_code_github(
         work_root = tempfile.mkdtemp(prefix="hal9-claude-code-")
         repo_dir = os.path.join(work_root, name)
 
-        h9.event("Claude Code", f"Cloning {public_url} (branch={branch}) into temp dir")
-        _clone_repo(clone_url, repo_dir, branch)
-
-        # Ensure remote stays authenticated for push without printing token
+        h9.event("Claude Code", f"Cloning {public_url} ({BASE_BRANCH}) into temp dir")
+        _clone_base_and_checkout_branch(clone_url, repo_dir, BASE_BRANCH, work_branch)
         _run_git(["remote", "set-url", "origin", clone_url], cwd=repo_dir)
 
-        h9.event("Claude Code", f"Running Claude Code (model={model})")
+        h9.event("Claude Code", f"Running Claude Code (model={model}) on branch {work_branch}")
         claude_summary = _run_claude_code(prompt, repo_dir, model, anthropic_key)
 
-        if not _has_changes(repo_dir):
+        commit_out = _commit_changes(repo_dir, commit_message)
+        if _commits_ahead_of_base(repo_dir, BASE_BRANCH) == 0:
             return (
-                f"Claude Code ran on {public_url} (branch '{branch}') but made no file changes.\n\n"
+                f"Claude Code ran on {public_url} but made no file changes, so no pull request was opened.\n\n"
                 f"Claude summary:\n{claude_summary}"
             )
 
-        h9.event("Claude Code", f"Pushing changes to origin/{branch}")
-        git_summary = _commit_and_push(repo_dir, branch, commit_message)
+        h9.event("Claude Code", f"Pushing {work_branch} and opening PR into {BASE_BRANCH}")
+        push_out = _push_branch(repo_dir, work_branch)
+        pr_body = (
+            f"{prompt.strip()}\n\n"
+            f"---\n"
+            f"Opened automatically by Hal9 Claude Code.\n\n"
+            f"Claude summary:\n{claude_summary}"
+        )
+        pr_url, pr_number = _create_pull_request(
+            owner=owner,
+            name=name,
+            token=github_pat,
+            title=title,
+            head=work_branch,
+            base=BASE_BRANCH,
+            body=pr_body,
+        )
 
         return (
-            f"Successfully updated {public_url} on branch '{branch}'.\n\n"
-            f"{git_summary}\n\n"
+            f"Opened pull request #{pr_number} into {BASE_BRANCH} for {public_url}.\n"
+            f"PR: {pr_url}\n"
+            f"Branch: {work_branch}\n\n"
+            f"Commit: {commit_out}\n"
+            f"Push: {push_out}\n\n"
             f"Claude summary:\n{claude_summary}"
         )
     except Exception as e:
-        msg = str(e)
-        msg = re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", msg)
+        msg = _redact_token(str(e))
         h9.event("Claude Code error", msg)
         return f"Error while running Claude Code on GitHub repo: {msg}"
     finally:
@@ -326,10 +407,10 @@ claude_code_github_description = {
     "function": {
         "name": "claude_code_github",
         "description": (
-            "Clones a GitHub repository into a temporary directory (not Hal9 storage), "
-            "uses Claude Code to implement the requested changes, then commits and pushes "
-            "to the specified branch (default main). Requires GITHUB_PAT and ANTHROPIC_API_KEY. "
-            "Use when the user wants Claude Code to modify a GitHub repo and push the result."
+            "Clones a GitHub repository, uses Claude Code (ANTHROPIC_API_KEY) to make the "
+            "requested code changes, pushes a feature branch, and opens a pull request into "
+            "main using GITHUB_PAT. Use this when the user wants to change code in a GitHub "
+            "repo and get a PR back. Never pushes directly to main."
         ),
         "strict": True,
         "parameters": {
@@ -352,7 +433,8 @@ claude_code_github_description = {
                 "branch": {
                     "type": "string",
                     "description": (
-                        "Git branch to push to. Use 'main' unless the user specifies another branch."
+                        "Feature branch to push and open the PR from. Do not use 'main'. "
+                        "If unsure, use a short name like 'hal9/update-readme'."
                     ),
                 },
                 "model": {
@@ -369,8 +451,14 @@ claude_code_github_description = {
                         "if unsure use 'Apply changes via Hal9 Claude Code'."
                     ),
                 },
+                "pr_title": {
+                    "type": "string",
+                    "description": (
+                        "Title for the GitHub pull request. Use a concise summary of the change."
+                    ),
+                },
             },
-            "required": ["repo", "prompt", "branch", "model", "commit_message"],
+            "required": ["repo", "prompt", "branch", "model", "commit_message", "pr_title"],
             "additionalProperties": False,
         },
     },

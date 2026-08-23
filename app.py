@@ -31,7 +31,8 @@ Tool routing rules:
 3. Available files are optional context. An empty file list is normal and is not an error — never refuse a request just because no files are present.
 4. Never mention tools or internal processes to the user.
 5. When a specialized tool is needed: pick the best one, use its result, then call final_response. If a tool fails, do not retry the same tool; explain the issue and suggest an alternative.
-6. Always end by calling final_response with the user-facing answer."""
+6. When the user wants to change code in a GitHub repository, use claude_code_github. It clones the repo, applies the change with Claude Code, and opens a pull request into main. Then call final_response with the PR URL.
+7. Always end by calling final_response with the user-facing answer."""
 
 # Always keep the system prompt current so routing fixes apply to existing chats.
 if messages and messages[0].get("role") == "system":
