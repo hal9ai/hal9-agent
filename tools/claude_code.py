@@ -75,9 +75,113 @@ def _authenticated_clone_url(owner: str, name: str, token: str) -> str:
     return f"https://x-access-token:{token}@github.com/{owner}/{name}.git"
 
 
+def _redact_token(text: str) -> str:
+    return re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", text)
+
+
+def _is_root() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return False
+    return geteuid() == 0
+
+
+def _privileged_variants(cmd: list[str], allow_sudo: bool = True) -> list[list[str]]:
+    variants = [cmd]
+    if allow_sudo and not _is_root() and shutil.which("sudo"):
+        variants.append(["sudo", "-n", *cmd])
+    return variants
+
+
+def _run_install_command(cmd: list[str], env: Optional[dict] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=5 * 60,
+    )
+
+
+def _ensure_git() -> str:
+    """
+    Return the git executable path, installing it via the system package
+    manager when it is missing. pip cannot install the git CLI.
+    """
+    existing = shutil.which("git")
+    if existing:
+        return existing
+
+    h9.event("Claude Code", "git not found; attempting to install it")
+
+    strategies: list[tuple[str, list[list[str]], Optional[dict], bool]] = []
+    apt_env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+    if shutil.which("apt-get"):
+        strategies.append((
+            "apt-get",
+            [
+                ["apt-get", "update", "-qq"],
+                ["apt-get", "install", "-y", "--no-install-recommends", "git"],
+            ],
+            apt_env,
+            True,
+        ))
+    if shutil.which("apk"):
+        strategies.append(("apk", [["apk", "add", "--no-cache", "git"]], None, True))
+    if shutil.which("dnf"):
+        strategies.append(("dnf", [["dnf", "install", "-y", "git"]], None, True))
+    if shutil.which("yum"):
+        strategies.append(("yum", [["yum", "install", "-y", "git"]], None, True))
+    if shutil.which("microdnf"):
+        strategies.append(("microdnf", [["microdnf", "install", "-y", "git"]], None, True))
+    if shutil.which("pacman"):
+        strategies.append(("pacman", [["pacman", "-Sy", "--noconfirm", "git"]], None, True))
+    if shutil.which("zypper"):
+        strategies.append(("zypper", [["zypper", "--non-interactive", "install", "git"]], None, True))
+    if shutil.which("brew"):
+        strategies.append(("brew", [["brew", "install", "git"]], None, False))
+
+    errors: list[str] = []
+    for name, commands, env, allow_sudo in strategies:
+        last_error = ""
+        installed = True
+        for cmd in commands:
+            step_ok = False
+            for variant in _privileged_variants(cmd, allow_sudo=allow_sudo):
+                result = _run_install_command(variant, env=env)
+                if result.returncode == 0:
+                    step_ok = True
+                    break
+                last_error = (result.stderr or result.stdout or "").strip()
+            if not step_ok:
+                # apt-get update can fail in locked environments; still try install.
+                if cmd and cmd[0] == "apt-get" and "update" in cmd:
+                    continue
+                installed = False
+                break
+        if not installed:
+            errors.append(f"{name}: {last_error}")
+            continue
+        git_path = shutil.which("git")
+        if git_path:
+            h9.event("Claude Code", f"Installed git via {name}: {git_path}")
+            return git_path
+        errors.append(f"{name}: command succeeded but git is still not on PATH")
+
+    details = "; ".join(errors) if errors else "no supported package manager found"
+    raise RuntimeError(
+        "git is not installed and could not be installed automatically "
+        f"({details}). Install git in the runtime image, or run this tool as root."
+    )
+
+
+def _git_bin() -> str:
+    return _ensure_git()
+
+
 def _run_git(args: list[str], cwd: str, check: bool = True) -> subprocess.CompletedProcess:
     result = subprocess.run(
-        ["git", *args],
+        [_git_bin(), *args],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -88,20 +192,17 @@ def _run_git(args: list[str], cwd: str, check: bool = True) -> subprocess.Comple
     return result
 
 
-def _redact_token(text: str) -> str:
-    return re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", text)
-
-
 def _clone_base_and_checkout_branch(clone_url: str, dest: str, base_branch: str, work_branch: str) -> None:
     """Clone `base_branch` (usually main), then create the feature branch from it."""
+    git = _git_bin()
     result = subprocess.run(
-        ["git", "clone", "--depth", "1", "--branch", base_branch, clone_url, dest],
+        [git, "clone", "--depth", "1", "--branch", base_branch, clone_url, dest],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         result = subprocess.run(
-            ["git", "clone", "--depth", "1", clone_url, dest],
+            [git, "clone", "--depth", "1", clone_url, dest],
             capture_output=True,
             text=True,
         )
@@ -342,7 +443,8 @@ def claude_code_github(
         github_pat = _require_env("GITHUB_PAT")
         anthropic_key = _require_env("ANTHROPIC_API_KEY")
         owner, name = _parse_github_repo(repo)
-    except ValueError as e:
+        _ensure_git()
+    except (ValueError, RuntimeError) as e:
         return f"Error: {e}"
 
     clone_url = _authenticated_clone_url(owner, name, github_pat)
