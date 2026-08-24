@@ -7,8 +7,6 @@ CSV/text/image analysis, app generation, website building, or even opening a pul
 request against a GitHub repository — before replying with a single, user-facing
 answer.
 
-![Hal9 Agent](thumbnail.jpg)
-
 ## Overview
 
 Hal9 Agent implements a classic **agentic tool-routing loop**:
