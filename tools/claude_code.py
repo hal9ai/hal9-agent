@@ -122,6 +122,22 @@ def _collect_text_from_sdk_message(message) -> list[str]:
     return texts
 
 
+def _print_sdk_progress(message, elapsed: float) -> None:
+    """Print a short, real-time status line for a streamed SDK message, if useful."""
+    try:
+        from claude_agent_sdk import AssistantMessage, ToolUseBlock
+    except ImportError:
+        return
+
+    if isinstance(message, AssistantMessage):
+        for block in getattr(message, "content", []) or []:
+            if isinstance(block, ToolUseBlock):
+                tool_input = getattr(block, "input", None) or {}
+                detail = tool_input.get("file_path") or tool_input.get("command") or ""
+                detail = f" ({_clip(str(detail), 60)})" if detail else ""
+                print(f"  [{int(elapsed)}s] Claude Code: using {block.name}{detail}", flush=True)
+
+
 async def _run_claude_agent_sdk(prompt: str, cwd: str, model: str, api_key: str) -> str:
     from claude_agent_sdk import query, ClaudeAgentOptions
 
@@ -149,9 +165,18 @@ async def _run_claude_agent_sdk(prompt: str, cwd: str, model: str, api_key: str)
         options = ClaudeAgentOptions(**options_kwargs)
 
     collected: list[str] = []
+    start = time.time()
+    last_heartbeat = start
     async for message in query(prompt=prompt, options=options):
         collected.extend(_collect_text_from_sdk_message(message))
+        now = time.time()
+        _print_sdk_progress(message, now - start)
+        # Heartbeat in case a step (e.g. a long Bash call) produces no messages for a while.
+        if now - last_heartbeat >= 20:
+            print(f"  [{int(now - start)}s] Claude Code still working...", flush=True)
+            last_heartbeat = now
 
+    print(f"Claude Code finished in {int(time.time() - start)}s.", flush=True)
     return "\n".join(collected).strip() or "Claude Code finished without a text summary."
 
 
@@ -179,19 +204,35 @@ def _run_claude_cli(prompt: str, cwd: str, model: str, api_key: str) -> str:
         ),
     ]
 
-    result = subprocess.run(
+    start = time.time()
+    process = subprocess.Popen(
         cmd,
         cwd=cwd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         env=env,
-        timeout=60 * 30,  # 30 minutes
+        bufsize=1,
     )
-    if result.returncode != 0:
-        err = (result.stderr or result.stdout or "unknown CLI error").strip()
-        raise RuntimeError(f"Claude Code CLI failed (exit {result.returncode}): {err}")
 
-    return (result.stdout or "").strip() or "Claude Code CLI finished without output."
+    output_lines: list[str] = []
+    deadline = start + 60 * 30  # 30 minutes
+    for line in process.stdout or []:
+        output_lines.append(line)
+        stripped = line.strip()
+        if stripped:
+            print(f"  Claude Code CLI: {_clip(stripped, 160)}", flush=True)
+        if time.time() > deadline:
+            process.kill()
+            raise RuntimeError("Claude Code CLI timed out after 30 minutes")
+
+    returncode = process.wait()
+    output = "".join(output_lines)
+    print(f"Claude Code CLI finished in {int(time.time() - start)}s.", flush=True)
+    if returncode != 0:
+        raise RuntimeError(f"Claude Code CLI failed (exit {returncode}): {_clip(output)}")
+
+    return output.strip() or "Claude Code CLI finished without output."
 
 
 def _run_claude_code(prompt: str, cwd: str, model: str, api_key: str) -> str:
@@ -200,8 +241,10 @@ def _run_claude_code(prompt: str, cwd: str, model: str, api_key: str) -> str:
         h9.event("Claude Code", "Using claude-agent-sdk Python package")
         return asyncio.run(_run_claude_agent_sdk(prompt, cwd, model, api_key))
     except ImportError:
+        print("claude-agent-sdk not installed; falling back to the 'claude' CLI...", flush=True)
         h9.event("Claude Code", "claude-agent-sdk not installed; falling back to CLI")
     except Exception as e:
+        print(f"Claude Code SDK failed ({e}); falling back to the 'claude' CLI...", flush=True)
         h9.event("Claude Code SDK error", str(e))
         # Fall through to CLI if SDK is present but failed in a recoverable way
         if shutil.which("claude") is None:
@@ -506,6 +549,9 @@ def claude_code_github(
     work_branch = _normalize_work_branch(branch, prompt)
     title = (pr_title or "").strip() or commit_message
 
+    task_start = time.time()
+    print(f"Starting Claude Code GitHub task for {repo}...", flush=True)
+
     try:
         github_pat = _require_env("GITHUB_PAT")
         anthropic_key = _require_env("ANTHROPIC_API_KEY")
@@ -531,13 +577,17 @@ def claude_code_github(
         fork_base = _resolve_base_branch(owner, name, github_pat)
         pr_base = _resolve_base_branch(pr_owner, pr_name, github_pat) if cross_fork else fork_base
 
+        print(f"Downloading repository {public_url} (branch {fork_base})...", flush=True)
         h9.event("Claude Code", f"Downloading {public_url} ({fork_base})")
         repo_dir = _clone_via_github_zip(owner, name, github_pat, dest, fork_base)
         before_snapshot = _snapshot_files(repo_dir)
+        print(f"Downloaded {len(before_snapshot)} files.", flush=True)
 
+        print(f"Running Claude Code (model={model}) to apply changes...", flush=True)
         h9.event("Claude Code", f"Running Claude Code (model={model}) on branch {work_branch}")
         claude_summary = _run_claude_code(prompt, repo_dir, model, anthropic_key)
 
+        print(f"Pushing branch '{work_branch}'...", flush=True)
         commit_sha = _publish_changes_via_github_api(
             owner=owner,
             name=name,
@@ -549,11 +599,14 @@ def claude_code_github(
             before=before_snapshot,
         )
         if not commit_sha:
+            print("No file changes were made; skipping pull request.", flush=True)
             return (
                 f"Claude Code ran on {public_url} but made no file changes, so no pull request was opened.\n\n"
                 f"Claude summary:\n{claude_summary}"
             )
+        print(f"Branch '{work_branch}' pushed (commit {commit_sha[:7]}).", flush=True)
 
+        print("Opening pull request...", flush=True)
         h9.event(
             "Claude Code",
             f"Opening PR {owner}:{work_branch} -> {pr_owner}/{pr_name}:{pr_base}"
@@ -576,6 +629,8 @@ def claude_code_github(
             body=pr_body,
             head_owner=owner if cross_fork else None,
         )
+        print(f"Pull request opened: {pr_url}", flush=True)
+        print(f"Done in {int(time.time() - task_start)}s.", flush=True)
 
         return (
             f"Opened pull request #{pr_number} into {pr_url_base} ({pr_base}).\n"
@@ -586,6 +641,7 @@ def claude_code_github(
         )
     except Exception as e:
         msg = _redact_token(str(e))
+        print(f"Error: {msg}", flush=True)
         h9.event("Claude Code error", msg)
         return f"Error while running Claude Code on GitHub repo: {msg}"
     finally:
