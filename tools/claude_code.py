@@ -236,6 +236,22 @@ def _github_json(method: str, url: str, token: str, **kwargs) -> requests.Respon
     )
 
 
+def _repo_upstream(owner: str, name: str, token: str) -> Optional[tuple[str, str]]:
+    """If owner/name is a fork, return the parent/source repo."""
+    response = _github_json("GET", f"https://api.github.com/repos/{owner}/{name}", token, timeout=30)
+    if response.status_code != 200:
+        return None
+    data = response.json() or {}
+    for key in ("parent", "source"):
+        full_name = (data.get(key) or {}).get("full_name")
+        if full_name:
+            try:
+                return _parse_github_repo(full_name)
+            except ValueError:
+                continue
+    return None
+
+
 def _resolve_base_branch(owner: str, name: str, token: str) -> str:
     response = _github_json("GET", f"https://api.github.com/repos/{owner}/{name}", token, timeout=30)
     if response.status_code != 200:
@@ -498,6 +514,13 @@ def claude_code_github(
     except ValueError as e:
         return f"Error: {e}"
 
+    # Models often set pr_repo equal to the fork. If this repo is a fork and
+    # no different destination was given, open the PR against the upstream.
+    if (pr_owner, pr_name) == (owner, name):
+        upstream = _repo_upstream(owner, name, github_pat)
+        if upstream:
+            pr_owner, pr_name = upstream
+
     public_url = f"https://github.com/{owner}/{name}"
     pr_url_base = f"https://github.com/{pr_owner}/{pr_name}"
     cross_fork = (pr_owner, pr_name) != (owner, name)
@@ -631,9 +654,9 @@ claude_code_github_description = {
                     "type": "string",
                     "description": (
                         "Repository that should receive the pull request, as 'owner/repo'. "
-                        "If the user wants the PR on a source/upstream repo (e.g. "
-                        "'hal9ai/hal9-agent') while working on a fork, set this to the upstream. "
-                        "If the PR should stay on the same repo as `repo`, pass the same value."
+                        "When contributing from a fork, this MUST be the upstream/source repo "
+                        "(e.g. repo='hal9oo1/hal9-agent', pr_repo='hal9ai/hal9-agent'). "
+                        "Do not copy `repo` into this field if the user named a different destination."
                     ),
                 },
             },
