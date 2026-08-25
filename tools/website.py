@@ -1,7 +1,90 @@
-import hal9 as h9
+import json
 import os
+import re
 
-from utils import generate_response
+from utils import generate_response, load_messages, save_messages, insert_message
+
+STORAGE_DIR = "./.storage/"
+MESSAGES_PATH = os.path.join(STORAGE_DIR, ".website_messages.json")
+FILES_STATE_PATH = os.path.join(STORAGE_DIR, ".website_files.json")
+
+SYSTEM_PROMPT = """You can build html applications for user requests. Your replies can include markdown code blocks but they must include a filename parameter after the language. For example,
+```javascript filename=code.js
+```
+
+The main html file must be named index.html. You can generate other web files like javascript, css, svg that are referenced from index.html. Prefer a single self-contained index.html with embedded <style> and <script> tags unless the user's request benefits from separate files.
+"""
+
+DEFAULT_INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Website</title>
+</head>
+<body>
+</body>
+</html>
+"""
+
+# Matches fenced code blocks tagged with a `filename=` parameter, e.g.
+# ```html filename=index.html
+# ...content...
+# ```
+FILENAME_BLOCK_RE = re.compile(
+    r"```[ \t]*[\w+-]*[ \t]+filename=(?P<filename>[^\s`]+)[ \t]*\r?\n(?P<content>.*?)```",
+    re.DOTALL,
+)
+
+
+def load_website_files(path=FILES_STATE_PATH):
+    """Loads the previously generated website files (if any) from disk."""
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as file:
+        try:
+            return json.load(file)
+        except json.JSONDecodeError:
+            return {}
+
+
+def save_website_files_state(files, path=FILES_STATE_PATH):
+    """Persists the current set of generated website files as JSON state."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(files, file, ensure_ascii=False, indent=2)
+
+
+def extract_files(response_content, default=None):
+    """
+    Parses fenced code blocks tagged with a `filename=` parameter out of a
+    model response and returns a dict mapping filename -> file content. Files
+    already present in `default` are preserved unless the response redefines
+    them, so incremental change requests only touch the files that were
+    actually regenerated.
+    """
+    files = dict(default) if default else {}
+
+    for match in FILENAME_BLOCK_RE.finditer(response_content):
+        filename = match.group("filename").strip().strip("`")
+        content = match.group("content")
+        if content.endswith("\n"):
+            content = content[:-1]
+        files[filename] = content
+
+    return files
+
+
+def write_website_files(files, directory=STORAGE_DIR):
+    """Writes every generated file directly to disk via plain file I/O."""
+    os.makedirs(directory, exist_ok=True)
+    for filename, content in files.items():
+        file_path = os.path.join(directory, filename)
+        parent_dir = os.path.dirname(file_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        with open(file_path, "w", encoding="utf-8") as file:
+            file.write(content)
+
 
 def website_generator(prompt):
   """
@@ -9,30 +92,32 @@ def website_generator(prompt):
     'prompt' with user change or requirements
   """
 
-  system = """You can build html applications for user requests. Your replies can include markdown code blocks but they must include a filename parameter after the language. For example,
-  ```javascript filename=code.js
-  ```
+  messages = load_messages(file_path=MESSAGES_PATH)
+  files = load_website_files()
 
-  The main html file must ne named index.html. You can generate other web files like javascript, css, svg that are referenced from index.html
-  """
+  if len(messages) < 1:
+      messages = insert_message(messages, "system", SYSTEM_PROMPT)
 
-  state = h9.load("website-state", { "messages": [{"role": "system", "content": system}], "files": {} })
-  messages = state["messages"]
-  files = state["files"]
+  messages = insert_message(messages, "user", prompt)
 
-  messages.append({"role": "user", "content": prompt})
+  model_response = generate_response(messages, reasoning_effort="default")
+  response_content = model_response.choices[0].message.content
 
-  completion = generate_response(messages, stream=True, reasoning_effort="default")
-  response = h9.complete(completion, messages, show = False)
+  files = extract_files(response_content, default=files)
 
-  files = h9.extract(response, default=files)
+  if not files.get("index.html"):
+      files["index.html"] = DEFAULT_INDEX_HTML
 
-  h9.save("website-state", { "messages": messages, "files": files }, hidden=True)
-  h9.save("index.html", files=files)
+  messages = insert_message(messages, "assistant", response_content)
 
-  messages.append({"role": "user", "content": "briefly describe what was accomplished"})
-  completion = generate_response(messages, reasoning_effort="none")
-  summary = h9.complete(completion, messages, show = False)
+  save_messages(messages, file_path=MESSAGES_PATH)
+  save_website_files_state(files)
+  write_website_files(files)
+
+  messages = insert_message(messages, "user", "briefly describe what was accomplished")
+  summary_response = generate_response(messages, reasoning_effort="none")
+  summary = summary_response.choices[0].message.content
+
   return summary
 
 website_generator_description = {
