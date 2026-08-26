@@ -1,15 +1,21 @@
 import json
 import os
 import re
+import time
 
 import hal9 as h9
 
 from utils import generate_response, load_messages, save_messages, insert_message
 
-STORAGE_DIR = "./.storage/"
+# State files (chat history + last-known file set) always live under
+# .storage/, separate from the actual website output below.
+STORAGE_DIR = os.path.join(".", ".storage")
 MESSAGES_PATH = os.path.join(STORAGE_DIR, ".website_messages.json")
 FILES_STATE_PATH = os.path.join(STORAGE_DIR, ".website_files.json")
-WEBSITE_DIR = "website"
+
+# The generated website's own files (index.html, css, js, ...) are written
+# here, never into .storage/.
+WEBSITE_DIR = os.path.join(".", "website")
 
 SYSTEM_PROMPT = """You can build html applications for user requests. Your replies can include markdown code blocks but they must include a filename parameter after the language. For example,
 ```javascript filename=code.js
@@ -89,6 +95,68 @@ def write_website_files(files, directory=WEBSITE_DIR):
             file.write(content)
 
 
+def _format_deployed_message(relative_path):
+    """Normalizes a deploy/asset result into a clean, printable message."""
+    if not relative_path:
+        return "Website deployed, but no deployment URL was returned."
+    return f"The website got deployed to: {str(relative_path).strip()}"
+
+
+def deploy_website(directory=WEBSITE_DIR):
+    """
+    Deploys the website directory and returns a status message describing
+    the outcome. Never raises: any failure (missing directory, network
+    error, bad response from the deploy target, an unsupported hal9 module,
+    etc.) is caught and turned into a human-readable message instead.
+    """
+    # Guard against the directory not existing yet (e.g. deploy is ever
+    # called before any files were generated) instead of letting the deploy
+    # call fail on a missing path.
+    os.makedirs(directory, exist_ok=True)
+
+    # During a live tool call the `hal9` module injected into the runtime
+    # only exposes input/load/save/event/asset/token/user/secret helpers —
+    # it does not have a `deploy` attribute. `hal9.deploy()` is a separate,
+    # CLI-only helper that ships with the `hal9` pip package (used for
+    # `hal9 deploy <path>` from a terminal) and, unlike this call site,
+    # requires name/typename/data/access/main/title/description to be
+    # passed explicitly since that function has no default parameter
+    # values of its own (only the CLI's click options do).
+    #
+    # Prefer `hal9.deploy()` when it's actually available (e.g. running
+    # this tool outside of a live chat turn), but always fall back to
+    # `hal9.asset()` -- which explicitly supports uploading a directory as
+    # a multi-file asset, the mechanism actually available to tools during
+    # a live turn -- so website deployment keeps working either way.
+    if hasattr(h9, "deploy"):
+        deploy_name = f"website-{int(time.time() * 1000)}"
+        try:
+            relative_path = h9.deploy(
+                directory,
+                target="hal9",
+                url=os.environ.get("HAL9_URL", "https://api.hal9.com"),
+                name=deploy_name,
+                typename="ability",
+                data=None,
+                access="private",
+                main="index.html",
+                title=None,
+                description=None,
+            )
+            return _format_deployed_message(relative_path)
+        except Exception as e:
+            print(f"hal9.deploy() failed ({e}); falling back to hal9.asset().")
+
+    if hasattr(h9, "asset"):
+        try:
+            relative_path = h9.asset(directory, title="Website")
+            return _format_deployed_message(relative_path)
+        except Exception as e:
+            return f"Deployment failed: {e}"
+
+    return "Deployment failed: no supported deploy/asset method found on the hal9 module."
+
+
 def website_generator(prompt):
   """
   Builds or modifies a website based on user description or a change request
@@ -117,8 +185,8 @@ def website_generator(prompt):
   save_website_files_state(files)
   write_website_files(files)
 
-  relative_path = h9.deploy(WEBSITE_DIR, target="hal9", url=os.environ.get("HAL9_URL", "https://api.hal9.com"))
-  print(f"The website got deployed to: {relative_path}")
+  deploy_status = deploy_website()
+  print(deploy_status)
 
   messages = insert_message(messages, "user", "briefly describe what was accomplished")
   summary_response = generate_response(messages, reasoning_effort="none")
