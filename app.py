@@ -40,7 +40,7 @@ if messages and messages[0].get("role") == "system":
 else:
     messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-user_input = input()
+user_input = h9.input()
 
 if is_url(user_input) or is_url_list(user_input):
     if is_url_list(user_input):
