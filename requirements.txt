@@ -8,3 +8,4 @@ scikit-learn
 numpy
 pillow
 claude-agent-sdk
+hal9
