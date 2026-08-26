@@ -2,11 +2,14 @@ import json
 import os
 import re
 
+import h9
+
 from utils import generate_response, load_messages, save_messages, insert_message
 
 STORAGE_DIR = "./.storage/"
 MESSAGES_PATH = os.path.join(STORAGE_DIR, ".website_messages.json")
 FILES_STATE_PATH = os.path.join(STORAGE_DIR, ".website_files.json")
+WEBSITE_DIR = "website"
 
 SYSTEM_PROMPT = """You can build html applications for user requests. Your replies can include markdown code blocks but they must include a filename parameter after the language. For example,
 ```javascript filename=code.js
@@ -74,7 +77,7 @@ def extract_files(response_content, default=None):
     return files
 
 
-def write_website_files(files, directory=STORAGE_DIR):
+def write_website_files(files, directory=WEBSITE_DIR):
     """Writes every generated file directly to disk via plain file I/O."""
     os.makedirs(directory, exist_ok=True)
     for filename, content in files.items():
@@ -113,6 +116,9 @@ def website_generator(prompt):
   save_messages(messages, file_path=MESSAGES_PATH)
   save_website_files_state(files)
   write_website_files(files)
+
+  relative_path = h9.deploy(WEBSITE_DIR, target="hal9", url=os.environ.get("HAL9_URL", "https://api.hal9.com"))
+  print(f"The website got deployed to: {relative_path}")
 
   messages = insert_message(messages, "user", "briefly describe what was accomplished")
   summary_response = generate_response(messages, reasoning_effort="none")
