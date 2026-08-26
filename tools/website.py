@@ -2,7 +2,7 @@ import json
 import os
 import re
 
-import h9
+import hal9 as h9
 
 from utils import generate_response, load_messages, save_messages, insert_message
 
