@@ -4,6 +4,7 @@ from tools.website import website_generator_description, website_generator
 from tools.code import claude_code_github_description, claude_code_github
 import hal9 as h9
 import os
+import sys
 
 # load messages
 messages = load_messages()
@@ -28,7 +29,13 @@ if messages and messages[0].get("role") == "system":
 else:
     messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-user_input = h9.input()
+# h9.input() only reads a single line and signals platform readiness via
+# h9.ready() before blocking on it. We read raw stdin instead so multiline
+# input (e.g. piped in from a CLI/CI run) is handled correctly, but we still
+# fire the readiness signal ourselves so platform integrations relying on it
+# keep working.
+h9.ready()
+user_input = sys.stdin.read()
 h9.event("User Prompt", f"{user_input}")
 user_input = user_input.replace("\f", "\n")
 messages = insert_message(messages, "user", user_input)
