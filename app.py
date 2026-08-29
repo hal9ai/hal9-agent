@@ -29,12 +29,7 @@ if messages and messages[0].get("role") == "system":
 else:
     messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-# h9.input() only reads a single line and signals platform readiness via
-# h9.ready() before blocking on it. We read raw stdin instead so multiline
-# input (e.g. piped in from a CLI/CI run) is handled correctly, but we still
-# fire the readiness signal ourselves so platform integrations relying on it
-# keep working.
-h9.ready()
+# read input with support for multiple lines
 user_input = sys.stdin.read()
 h9.event("User Prompt", f"{user_input}")
 user_input = user_input.replace("\f", "\n")
