@@ -146,7 +146,10 @@ async def _run_claude_agent_sdk(prompt: str, cwd: str, model: str, api_key: str)
         "model": model,
         "permission_mode": "bypassPermissions",
         "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "NotebookEdit"],
-        "max_turns": 50,
+        # A real "investigate a large repo, make edits, write a test, run it" task
+        # routinely needs well over 50 turns just to explore before touching a
+        # single file — this is a session budget, not a small task's step count.
+        "max_turns": 150,
         "env": {"ANTHROPIC_API_KEY": api_key},
         "system_prompt": (
             "You are editing a cloned git repository to fulfill the user's request. "
@@ -643,7 +646,18 @@ def claude_code_github(
         msg = _redact_token(str(e))
         print(f"Error: {msg}", flush=True)
         h9.event("Claude Code error", msg)
-        return f"Error while running Claude Code on GitHub repo: {msg}"
+        # This tool re-clones the repo and starts a fresh turn budget on every
+        # call — calling it again with the same broad prompt after a failure
+        # like this repeats the exact same expensive work and hits the exact
+        # same wall. Say so explicitly, since the orchestrating model otherwise
+        # tends to just retry verbatim.
+        return (
+            f"Error while running Claude Code on GitHub repo: {msg}\n\n"
+            "Do not call this tool again with the same request — a retry restarts "
+            "from a fresh clone and will very likely fail the same way. Instead, "
+            "report this error to the user, or if you must retry, narrow the "
+            "prompt to a smaller, more specific piece of the original request."
+        )
     finally:
         if work_root and os.path.isdir(work_root):
             shutil.rmtree(work_root, ignore_errors=True)
