@@ -2,6 +2,7 @@ from utils import generate_response, load_messages, insert_message, execute_func
 from tools.other_tools import final_response_description, final_response
 from tools.website import website_generator_description, website_generator
 from tools.code import claude_code_github_description, claude_code_github
+from tools.calculator import python_calculator_description, python_calculator
 import hal9 as h9
 import os
 import sys
@@ -10,8 +11,8 @@ import sys
 messages = load_messages()
 
 # load tools
-tools_descriptions = [final_response_description, website_generator_description, claude_code_github_description]
-tools_functions = [final_response, website_generator, claude_code_github]
+tools_descriptions = [final_response_description, website_generator_description, claude_code_github_description, python_calculator_description]
+tools_functions = [final_response, website_generator, claude_code_github, python_calculator]
 
 SYSTEM_PROMPT = """You are Hal9, a helpful and highly capable AI assistant.
 
@@ -19,9 +20,10 @@ Tool routing rules:
 1. For greetings, small talk, or anything that doesn't need a specialized capability, call final_response immediately with a friendly, direct reply.
 2. When the user wants to build or update a website, use website_generator, then call final_response with a summary.
 3. When the user wants to change code in a GitHub repository, use claude_code_github. If they name a fork and a source/upstream repo, set repo to the fork and pr_repo to the upstream so the PR is opened on the source. Then call final_response with the PR URL.
-4. Never mention tools or internal processes to the user.
-5. If a tool fails, do not retry it blindly — explain the issue and suggest an alternative, then call final_response.
-6. Always end by calling final_response with the user-facing answer."""
+4. For arithmetic, math, unit conversions, or other simple calculations, use python_calculator, then call final_response with the result.
+5. Never mention tools or internal processes to the user.
+6. If a tool fails, do not retry it blindly — explain the issue and suggest an alternative, then call final_response.
+7. Always end by calling final_response with the user-facing answer."""
 
 # Always keep the system prompt current so routing fixes apply to existing chats.
 if messages and messages[0].get("role") == "system":
