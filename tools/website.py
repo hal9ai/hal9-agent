@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from urllib.parse import urlsplit
 
 import hal9 as h9
 
@@ -117,7 +118,18 @@ def website_generator(prompt):
   save_website_files_state(files)
   write_website_files(files)
 
-  relative_path = h9.deploy(WEBSITE_DIR, target="hal9", url=os.environ.get("HAL9_URL", "https://api.hal9.com"))
+  deployed_url = h9.deploy(
+      WEBSITE_DIR,
+      target="hal9",
+      url=os.environ.get("HAL9_URL", "https://api.hal9.com"),
+      typename="website",
+      main="index.html",
+  )
+  # h9.deploy() echoes back whatever host it just POSTed to — HAL9_URL is the
+  # control plane's internal address, never reachable from a user's browser —
+  # so only the path is usable here. It also survives unchanged if this
+  # deployment is ever moved to a different host/domain.
+  relative_path = urlsplit(deployed_url).path
   print(f"The website got deployed to: {relative_path}")
 
   messages = insert_message(messages, "user", "briefly describe what was accomplished")
