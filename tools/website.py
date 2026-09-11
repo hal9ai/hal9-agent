@@ -1,6 +1,8 @@
+import io
 import json
 import os
 import re
+from contextlib import redirect_stdout
 from urllib.parse import urlsplit
 
 import hal9 as h9
@@ -10,6 +12,7 @@ from utils import generate_response, load_messages, save_messages, insert_messag
 STORAGE_DIR = "./.storage/"
 MESSAGES_PATH = os.path.join(STORAGE_DIR, ".website_messages.json")
 FILES_STATE_PATH = os.path.join(STORAGE_DIR, ".website_files.json")
+DEPLOY_STATE_PATH = os.path.join(STORAGE_DIR, ".website_deploy.json")
 WEBSITE_DIR = "website"
 
 SYSTEM_PROMPT = """You can build html applications for user requests. Your replies can include markdown code blocks but they must include a filename parameter after the language. For example,
@@ -58,15 +61,38 @@ def save_website_files_state(files, path=FILES_STATE_PATH):
         json.dump(files, file, ensure_ascii=False, indent=2)
 
 
+def load_deploy_name(path=DEPLOY_STATE_PATH):
+    """Loads the project name a previous deploy in this chat was assigned, if any."""
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as file:
+        try:
+            return json.load(file).get("name")
+        except json.JSONDecodeError:
+            return None
+
+
+def save_deploy_name(name, path=DEPLOY_STATE_PATH):
+    """Persists the assigned project name so later calls in this chat update it instead of deploying a new one."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump({"name": name}, file)
+
+
 def extract_files(response_content, default=None):
     """
     Parses fenced code blocks tagged with a `filename=` parameter out of a
-    model response and returns a dict mapping filename -> file content. Files
-    already present in `default` are preserved unless the response redefines
-    them, so incremental change requests only touch the files that were
-    actually regenerated.
+    model response and returns (files, updated): a dict mapping
+    filename -> file content, and the set of filenames the response itself
+    actually provided code for. Files already present in `default` are
+    preserved unless the response redefines them, so incremental change
+    requests only touch the files that were actually regenerated. `updated`
+    is empty when the response had no properly-tagged code block at all —
+    the caller's signal that nothing was really produced, regardless of what
+    the response's prose claims.
     """
     files = dict(default) if default else {}
+    updated = set()
 
     for match in FILENAME_BLOCK_RE.finditer(response_content):
         filename = match.group("filename").strip().strip("`")
@@ -74,8 +100,9 @@ def extract_files(response_content, default=None):
         if content.endswith("\n"):
             content = content[:-1]
         files[filename] = content
+        updated.add(filename)
 
-    return files
+    return files, updated
 
 
 def write_website_files(files, directory=WEBSITE_DIR):
@@ -98,41 +125,69 @@ def website_generator(prompt):
 
   messages = load_messages(file_path=MESSAGES_PATH)
   files = load_website_files()
+  had_site = bool(files.get("index.html"))
 
   if len(messages) < 1:
       messages = insert_message(messages, "system", SYSTEM_PROMPT)
 
   messages = insert_message(messages, "user", prompt)
 
-  model_response = generate_response(messages, reasoning_effort="default")
+  # `reasoning_effort` other than "none" makes generate_response() also set
+  # reasoning_format="hidden" — for a reasoning-capable model that means its
+  # actual work (here, writing the HTML) happens in a reasoning channel the
+  # API response strips out entirely, leaving little or nothing in the
+  # `content` this function actually parses. "none" keeps the real answer
+  # where extract_files() can see it.
+  model_response = generate_response(messages, reasoning_effort="none")
   response_content = model_response.choices[0].message.content
 
-  files = extract_files(response_content, default=files)
+  files, updated = extract_files(response_content, default=files)
+  messages = insert_message(messages, "assistant", response_content)
+  save_messages(messages, file_path=MESSAGES_PATH)
+
+  if not updated:
+      # The response had no properly-tagged code block at all, so nothing
+      # was actually produced — its own prose can't be trusted to describe
+      # what changed. Say so honestly rather than silently deploying a blank
+      # placeholder (or redeploying whatever already existed) while the
+      # model claims success; app.py's tool-failure rule relays this as-is.
+      if had_site:
+          return "I wasn't able to make that change — the site's code didn't come through. Could you try rephrasing the request?"
+      return "I wasn't able to generate the website code for that request — could you try rephrasing what you'd like?"
 
   if not files.get("index.html"):
       files["index.html"] = DEFAULT_INDEX_HTML
 
-  messages = insert_message(messages, "assistant", response_content)
-
-  save_messages(messages, file_path=MESSAGES_PATH)
   save_website_files_state(files)
   write_website_files(files)
 
+  # h9.deploy() defaults `name` to None, which the platform then assigns a
+  # fresh, uniquely-timestamped name for — every call would otherwise deploy
+  # a brand-new project instead of updating the one this chat already made,
+  # leaving whatever URL the user has open never seeing later changes. The
+  # name assigned on this chat's first deploy is reused for every later one.
+  deploy_name = load_deploy_name()
   deployed_url = h9.deploy(
       WEBSITE_DIR,
       target="hal9",
       url=os.environ.get("HAL9_URL", "https://api.hal9.com"),
       typename="website",
       main="index.html",
+      name=deploy_name,
   )
   # h9.deploy() echoes back whatever host it just POSTed to — HAL9_URL is the
   # control plane's internal address, never reachable from a user's browser —
   # so only the path is usable here. It also survives unchanged if this
   # deployment is ever moved to a different host/domain.
   relative_path = urlsplit(deployed_url).path
-  print(f"The website got deployed to: {relative_path}")
+  if not deploy_name:
+      save_deploy_name(relative_path.rsplit("/", 1)[-1])
 
-  messages = insert_message(messages, "user", "briefly describe what was accomplished")
+  messages = insert_message(
+      messages,
+      "user",
+      f"briefly describe what was accomplished, and mention the site is available at {relative_path}",
+  )
   summary_response = generate_response(messages, reasoning_effort="none")
   summary = summary_response.choices[0].message.content
 

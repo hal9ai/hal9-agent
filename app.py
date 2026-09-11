@@ -23,7 +23,8 @@ Tool routing rules:
 4. For arithmetic, math, unit conversions, or other simple calculations, use python_calculator, then call final_response with the result.
 5. Never mention tools or internal processes to the user.
 6. If a tool fails, do not retry it blindly — explain the issue and suggest an alternative, then call final_response.
-7. Always end by calling final_response with the user-facing answer."""
+7. Always end by calling final_response with the user-facing answer.
+8. Whenever a tool result includes a link to something built or deployed (e.g. a website's path), present it in final_message as a proper markdown link — e.g. `[my-website](/javier/website-1789153067343)` — never as bare/plain text."""
 
 # Always keep the system prompt current so routing fixes apply to existing chats.
 if messages and messages[0].get("role") == "system":
